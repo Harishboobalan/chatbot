@@ -4,6 +4,8 @@ Credentials for the *Destination service* come from the environment:
   - On Cloud Foundry: the bound `destination` service in VCAP_SERVICES.
   - Locally: VCAP_SERVICES in default-env.json, or a destination service key in
     destination-key.json / the DESTINATION_SERVICE_KEY env var.
+  - In SAP Business Application Studio with none of the above: the dev space's destination
+    proxy (destination must have WebIDEEnabled=true), so only the destination name is needed.
 The AI Core credentials themselves live in the destination, so none are needed here.
 """
 import json
@@ -13,6 +15,7 @@ import time
 import requests
 
 TIMEOUT = 60
+BAS_PROXY_URL = os.environ.get("DESTINATION_PROXY_URL")  # set inside SAP Business Application Studio
 _cache = {}
 
 
@@ -53,13 +56,55 @@ def _destination_service_credentials():
             key = f.read()
     if key:
         return json.loads(key)
+    return None
 
-    raise StepError(
-        "destination-service",
-        "No Destination service credentials found. Fill DESTINATION_CLIENT_ID, DESTINATION_CLIENT_SECRET, "
-        "DESTINATION_AUTH_URL and DESTINATION_URI in .env (or put the service key in destination-key.json). "
-        "On Cloud Foundry, bind a 'destination' service instance instead.",
-    )
+
+def _bas_destination(name):
+    """Resolve a destination through the SAP Business Application Studio destination proxy.
+
+    BAS hides the destination's secrets, so calls go to http://<name>.dest and the proxy adds auth.
+    """
+    try:
+        resp = requests.get(BAS_PROXY_URL.rstrip("/") + "/api/listDestinations", timeout=TIMEOUT)
+        resp.raise_for_status()
+        destinations = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        raise StepError("destination-lookup", f"Cannot list destinations from the BAS destination proxy: {e}")
+
+    config = next((d for d in destinations if d.get("Name", "").lower() == name.lower()), None)
+    if not config:
+        raise StepError(
+            "destination-lookup",
+            f"Destination '{name}' is not visible in this BAS dev space. It must be in the same subaccount as "
+            "BAS and have the additional property WebIDEEnabled=true (then run: curl http://localhost:8887/reload).",
+            {"available": sorted(d.get("Name") for d in destinations)},
+        )
+
+    configured = (config.get("URL") or config.get("Host") or "").rstrip("/")
+    if not configured:
+        raise StepError("destination-lookup", "Destination has no URL", config)
+    url = configured[:-3] if configured.endswith("/v2") else configured
+
+    headers = {k[len("URL.headers."):]: v for k, v in config.items() if k.startswith("URL.headers.")}
+    resource_group = headers.pop("AI-Resource-Group", None) or os.environ.get("AI_RESOURCE_GROUP", "default")
+    return {
+        "url": url,
+        "headers": headers,
+        "resource_group": resource_group,
+        "auth_type": config.get("Authentication"),
+        "raw": {k: v for k, v in config.items() if "secret" not in k.lower() and "password" not in k.lower()},
+        # Requests to URLs under `configured` are sent to `http://<name>.dest` instead
+        "proxy": (configured, f"http://{config['Name']}.dest"),
+    }
+
+
+def _via_proxy(dest, url):
+    """Rewrite an AI Core URL to go through the BAS destination proxy when the destination came from BAS."""
+    if dest.get("proxy"):
+        configured, proxy_base = dest["proxy"]
+        if url.startswith(configured):
+            return proxy_base + url[len(configured):]
+    return url
 
 
 def _short(resp):
@@ -76,6 +121,17 @@ def get_destination(name, force=False):
         return cached["value"]
 
     creds = _destination_service_credentials()
+    if creds is None:
+        if not BAS_PROXY_URL:
+            raise StepError(
+                "destination-service",
+                "No Destination service credentials found. Fill DESTINATION_CLIENT_ID, DESTINATION_CLIENT_SECRET, "
+                "DESTINATION_AUTH_URL and DESTINATION_URI in .env (or put the service key in destination-key.json). "
+                "On Cloud Foundry, bind a 'destination' service instance instead.",
+            )
+        value = _bas_destination(name)
+        _cache[name] = {"value": value, "expires": time.time() + 300}
+        return value
 
     # 1. Token for the Destination service itself
     try:
@@ -154,7 +210,7 @@ def _ai_headers(dest, resource_group=None):
 def list_deployments(dest, resource_group=None):
     try:
         resp = requests.get(
-            dest["url"] + "/v2/lm/deployments",
+            _via_proxy(dest, dest["url"] + "/v2/lm/deployments"),
             params={"status": "RUNNING"},
             headers=_ai_headers(dest, resource_group),
             timeout=TIMEOUT,
@@ -181,7 +237,7 @@ def list_deployments(dest, resource_group=None):
 def chat(dest, deployment, messages, model=None, resource_group=None):
     """Send the conversation to a deployment. Returns the assistant reply text."""
     headers = _ai_headers(dest, resource_group)
-    base = deployment["url"].rstrip("/")
+    base = _via_proxy(dest, deployment["url"].rstrip("/"))
     system = [m for m in messages if m["role"] == "system"]
     convo = [m for m in messages if m["role"] != "system"]
 
