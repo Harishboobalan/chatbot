@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Core Destination Chat</title>
+<style>
+  :root { --bg:#f5f6f8; --panel:#fff; --text:#1d2129; --muted:#6b7280; --line:#e3e6ea; --accent:#0a6ed1; --ok:#107e3e; --err:#bb0000; --user:#e8f1fb; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14171b; --panel:#1d2127; --text:#e6e8eb; --muted:#9aa3ad; --line:#2d333b; --accent:#4da3ff; --ok:#3fb950; --err:#ff6b6b; --user:#1f3349; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:1100px; margin:0 auto; padding:16px; display:grid; grid-template-columns:340px 1fr; gap:16px; height:100vh; }
+  @media (max-width:800px) { main { grid-template-columns:1fr; height:auto; } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; display:flex; flex-direction:column; min-height:0; }
+  h1 { font-size:16px; margin:0 0 12px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  input, select, textarea { width:100%; padding:8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; }
+  button { margin-top:12px; padding:8px 14px; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { margin-top:14px; font-size:13px; overflow:auto; }
+  .ok { color:var(--ok); } .err { color:var(--err); }
+  pre { white-space:pre-wrap; word-break:break-word; font-size:12px; background:var(--bg); padding:8px; border-radius:6px; margin:6px 0 0; }
+  #log { flex:1; overflow:auto; display:flex; flex-direction:column; gap:10px; padding-bottom:8px; }
+  .msg { padding:10px 12px; border-radius:8px; max-width:85%; white-space:pre-wrap; }
+  .user { align-self:flex-end; background:var(--user); }
+  .assistant { align-self:flex-start; border:1px solid var(--line); }
+  .error { align-self:stretch; color:var(--err); border:1px solid var(--err); }
+  form { display:flex; gap:8px; align-items:flex-end; }
+  form textarea { resize:none; height:44px; }
+  form button { margin:0; height:44px; }
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <h1>1. Destination check</h1>
+    <label for="dest">AI Core destination name</label>
+    <input id="dest" placeholder="e.g. AICORE">
+    <label for="rg">Resource group (blank = destination / "default")</label>
+    <input id="rg" placeholder="default">
+    <button id="checkBtn">Test destination</button>
+    <div id="status"></div>
+    <label for="dep">Deployment</label>
+    <select id="dep" disabled><option>Run the check first</option></select>
+    <label for="model">Model name (orchestration only)</label>
+    <input id="model" placeholder="gpt-4o">
+  </section>
+
+  <section>
+    <h1>2. Chat</h1>
+    <div id="log"></div>
+    <form id="chatForm">
+      <textarea id="input" placeholder="Ask anything… (Enter to send)" disabled></textarea>
+      <button id="sendBtn" disabled>Send</button>
+    </form>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let deployments = [], history = [];
+
+fetch('/api/config').then(r => r.json()).then(c => { $('dest').value = c.destination || ''; $('rg').value = c.resourceGroup || ''; });
+
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const errHtml = d => `<div class="err">✗ [${esc(d.step)}] ${esc(d.error)}</div>` + (d.detail ? `<pre>${esc(JSON.stringify(d.detail, null, 2))}</pre>` : '');
+
+async function post(url, body) {
+  let r;
+  try {
+    r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+  } catch (e) {
+    return { ok:false, step:'network', error:`Cannot reach the app server (${e.message}). Is "python app.py" running, and did you open http://localhost:5000 rather than the HTML file?` };
+  }
+  try { return await r.json(); } catch { return { ok:false, step:'http', error:`HTTP ${r.status}` }; }
+}
+
+$('checkBtn').onclick = async () => {
+  $('checkBtn').disabled = true;
+  $('status').innerHTML = 'Checking…';
+  let d;
+  try { d = await post('/api/check', { destination:$('dest').value, resourceGroup:$('rg').value }); }
+  finally { $('checkBtn').disabled = false; }
+  if (!d.ok) { $('status').innerHTML = errHtml(d); return; }
+  deployments = d.deployments;
+  $('status').innerHTML =
+    `<div class="ok">✓ Destination resolved: ${esc(d.destination.url)}</div>` +
+    `<div class="ok">✓ Auth: ${esc(d.destination.authentication)}</div>` +
+    `<div class="ok">✓ AI Core reachable (resource group "${esc(d.destination.resourceGroup)}")</div>` +
+    `<div class="${deployments.length ? 'ok' : 'err'}">${deployments.length ? '✓' : '✗'} ${deployments.length} running deployment(s)</div>`;
+  $('dep').innerHTML = deployments.map(x => `<option value="${esc(x.id)}">${esc(x.scenario)} · ${esc(x.model || x.executable)} · ${esc(x.id)}</option>`).join('') || '<option>No running deployments</option>';
+  const orch = deployments.find(x => x.scenario === 'orchestration');
+  if (orch) $('dep').value = orch.id;
+  const on = deployments.length > 0;
+  $('dep').disabled = $('input').disabled = $('sendBtn').disabled = !on;
+};
+
+function add(role, html) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + role;
+  el.innerHTML = html;
+  $('log').appendChild(el);
+  $('log').scrollTop = $('log').scrollHeight;
+  return el;
+}
+
+$('chatForm').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('input').value.trim();
+  if (!text) return;
+  $('input').value = '';
+  history.push({ role:'user', content:text });
+  add('user', esc(text));
+  const pending = add('assistant', '…');
+  $('sendBtn').disabled = true;
+  let d;
+  try { d = await post('/api/chat', { destination:$('dest').value, resourceGroup:$('rg').value, deploymentId:$('dep').value, model:$('model').value, messages:history }); }
+  finally { $('sendBtn').disabled = false; }
+  if (d.ok) { pending.textContent = d.reply; history.push({ role:'assistant', content:d.reply }); }
+  else { history.pop(); pending.className = 'msg error'; pending.innerHTML = errHtml(d); }
+};
+$('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('chatForm').requestSubmit(); } });
+</script>
+</body>
+</html>

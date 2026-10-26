@@ -1,0 +1,12 @@
+applications:
+  - name: aicore-destination-chat
+    memory: 256M
+    random-route: true
+    buildpacks:
+      - python_buildpack
+    env:
+      AICORE_DESTINATION: CUSTOMER_HEARTBIT_AICORE_DESTINATION
+      # AI_RESOURCE_GROUP: default
+    services:
+      # Destination service instance - BTP injects its credentials automatically at runtime
+      - aicore-chat-destination
